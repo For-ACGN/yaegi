@@ -18,7 +18,7 @@ import (
 )
 
 func init() {
-	Symbols["guthib.com/baz"] = map[string]reflect.Value{
+	Symbols["guthib.com/baz/baz"] = map[string]reflect.Value{
 		// function, constant and variable definitions
 		"Hello": reflect.ValueOf(baz.Hello),
 	}
@@ -43,7 +43,7 @@ func TestPackages(t *testing.T) {
 			// We check this one because it shows both defects when we break it: the value
 			// gets corrupted, and the type becomes token.INT
 			// TODO(mpl): if the ident between key and value becomes annoying, be smarter about it.
-			contains: `"MaxFloat64":             reflect.ValueOf(constant.MakeFromLiteral("179769313486231570814527423731704356798100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", token.FLOAT, 0)),`,
+			contains: `"MaxFloat32":             reflect.ValueOf(constant.MakeFromLiteral("340282346638528859811704183484516925440", token.FLOAT, 0)),`,
 		},
 		{
 			desc:     "using relative path, using go.mod",
@@ -101,7 +101,7 @@ import (
 )
 
 func init() {
-	Symbols["guthib.com/variadic"] = map[string]reflect.Value{
+	Symbols["guthib.com/variadic/variadic"] = map[string]reflect.Value{
 		// type definitions
 		"Variadic": reflect.ValueOf((*variadic.Variadic)(nil)),
 
@@ -112,7 +112,8 @@ func init() {
 
 // _guthib_com_variadic_Variadic is an interface wrapper for Variadic type
 type _guthib_com_variadic_Variadic struct {
-	WCall func(method string, args ...[]interface{}) (interface{}, error)
+	IValue interface{}
+	WCall  func(method string, args ...[]interface{}) (interface{}, error)
 }
 
 func (W _guthib_com_variadic_Variadic) Call(method string, args ...[]interface{}) (interface{}, error) {

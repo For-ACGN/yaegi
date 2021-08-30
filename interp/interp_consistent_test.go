@@ -50,6 +50,7 @@ func TestInterpConsistencyBuild(t *testing.T) {
 			file.Name() == "import6.go" || // expect error
 			file.Name() == "init1.go" || // expect error
 			file.Name() == "io0.go" || // use random number
+			file.Name() == "issue-1093.go" || // expect error
 			file.Name() == "op1.go" || // expect error
 			file.Name() == "op7.go" || // expect error
 			file.Name() == "op9.go" || // expect error
@@ -97,7 +98,9 @@ func TestInterpConsistencyBuild(t *testing.T) {
 			file.Name() == "server1.go" || // syntax parsing
 			file.Name() == "server0.go" || // syntax parsing
 			file.Name() == "server.go" || // syntax parsing
-			file.Name() == "range9.go" { // expect error
+			file.Name() == "range9.go" || // expect error
+			file.Name() == "unsafe6.go" || // needs go.mod to be 1.17
+			file.Name() == "unsafe7.go" { // needs go.mod to be 1.17
 			continue
 		}
 
@@ -114,9 +117,15 @@ func TestInterpConsistencyBuild(t *testing.T) {
 			os.Stdout = w
 
 			i := interp.New(interp.Options{GoPath: build.Default.GOPATH})
-			i.Use(stdlib.Symbols)
-			i.Use(interp.Symbols)
-			i.Use(unsafe.Symbols)
+			if err := i.Use(stdlib.Symbols); err != nil {
+				t.Fatal(err)
+			}
+			if err := i.Use(interp.Symbols); err != nil {
+				t.Fatal(err)
+			}
+			if err := i.Use(unsafe.Symbols); err != nil {
+				t.Fatal(err)
+			}
 
 			_, err = i.EvalPath(filePath)
 			if err != nil {
@@ -210,8 +219,13 @@ func TestInterpErrorConsistency(t *testing.T) {
 			expectedExec:   "3:17: too many arguments to return",
 		},
 		{
+			fileName:       "issue-1093.go",
+			expectedInterp: "9:6: cannot use type untyped string as type int in assignment",
+			expectedExec:   `9:4: cannot use "a" + b() (type string) as type int in assignment`,
+		},
+		{
 			fileName:       "op1.go",
-			expectedInterp: "5:2: invalid operation: mismatched types int and float64",
+			expectedInterp: "5:2: invalid operation: mismatched types int and untyped float",
 			expectedExec:   "5:4: constant 1.3 truncated to integer",
 		},
 		{
@@ -254,7 +268,9 @@ func TestInterpErrorConsistency(t *testing.T) {
 			filePath := filepath.Join("..", "_test", test.fileName)
 
 			i := interp.New(interp.Options{GoPath: build.Default.GOPATH})
-			i.Use(stdlib.Symbols)
+			if err := i.Use(stdlib.Symbols); err != nil {
+				t.Fatal(err)
+			}
 
 			_, errEval := i.EvalPath(filePath)
 			if errEval == nil {

@@ -20,6 +20,11 @@ func TestFile(t *testing.T) {
 	filePath := "../_test/str.go"
 	runCheck(t, filePath)
 
+	defer func() {
+		_ = os.Setenv("YAEGI_SPECIAL_STDIO", "0")
+	}()
+	_ = os.Setenv("YAEGI_SPECIAL_STDIO", "1")
+
 	baseDir := filepath.Join("..", "_test")
 	files, err := ioutil.ReadDir(baseDir)
 	if err != nil {
@@ -50,9 +55,15 @@ func runCheck(t *testing.T, p string) {
 	}
 	var stdout, stderr bytes.Buffer
 	i := interp.New(interp.Options{GoPath: goPath, Stdout: &stdout, Stderr: &stderr})
-	i.Use(interp.Symbols)
-	i.Use(stdlib.Symbols)
-	i.Use(unsafe.Symbols)
+	if err := i.Use(interp.Symbols); err != nil {
+		t.Fatal(err)
+	}
+	if err := i.Use(stdlib.Symbols); err != nil {
+		t.Fatal(err)
+	}
+	if err := i.Use(unsafe.Symbols); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err := i.EvalPath(p)
 	if errWanted {

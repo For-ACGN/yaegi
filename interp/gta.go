@@ -1,6 +1,7 @@
 package interp
 
 import (
+	"path"
 	"path/filepath"
 	"reflect"
 )
@@ -78,11 +79,9 @@ func (interp *Interpreter) gta(root *node, rpath, importPath string) ([]*node, e
 					return false
 				}
 				if typ.isBinMethod {
-					typ = &itype{cat: valueT, rtype: typ.methodCallType(), isBinMethod: true, scope: sc}
+					typ = valueTOf(typ.methodCallType(), isBinMethod(), withScope(sc))
 				}
-				if sc.sym[dest.ident] == nil || sc.sym[dest.ident].typ.incomplete {
-					sc.sym[dest.ident] = &symbol{kind: varSym, global: true, index: sc.add(typ), typ: typ, rval: val, node: n}
-				}
+				sc.sym[dest.ident] = &symbol{kind: varSym, global: true, index: sc.add(typ), typ: typ, rval: val, node: n}
 				if n.anc.kind == constDecl {
 					sc.sym[dest.ident].kind = constSym
 					if childPos(n) == len(n.anc.child)-1 {
@@ -150,7 +149,8 @@ func (interp *Interpreter) gta(root *node, rpath, importPath string) ([]*node, e
 						sc.sym[typeName] = &symbol{kind: typeSym, typ: &itype{name: typeName, path: importPath, incomplete: true, node: rtn.child[0], scope: sc}}
 						elementType = sc.sym[typeName].typ
 					}
-					rcvrtype = &itype{cat: ptrT, val: elementType, incomplete: elementType.incomplete, node: rtn, scope: sc}
+					rcvrtype = ptrOf(elementType, withNode(rtn), withScope(sc))
+					rcvrtype.incomplete = elementType.incomplete
 					elementType.method = append(elementType.method, n)
 				} else {
 					rcvrtype = sc.getType(typeName)
@@ -189,28 +189,34 @@ func (interp *Interpreter) gta(root *node, rpath, importPath string) ([]*node, e
 			}
 			// Try to import a binary package first, or a source package
 			var pkgName string
-			if interp.binPkg[ipath] != nil {
+			if packageName := path.Base(ipath); path.Dir(ipath) == packageName {
+				ipath = packageName
+			}
+			if pkg := interp.binPkg[ipath]; pkg != nil {
 				switch name {
 				case "_": // no import of symbols
 				case ".": // import symbols in current scope
-					for n, v := range interp.binPkg[ipath] {
+					for n, v := range pkg {
 						typ := v.Type()
 						if isBinType(v) {
 							typ = typ.Elem()
 						}
-						sc.sym[n] = &symbol{kind: binSym, typ: &itype{cat: valueT, rtype: typ, scope: sc}, rval: v}
+						sc.sym[n] = &symbol{kind: binSym, typ: valueTOf(typ, withScope(sc)), rval: v}
 					}
 				default: // import symbols in package namespace
 					if name == "" {
-						name = identifier.FindString(ipath)
+						name = interp.pkgNames[ipath]
 					}
-					// imports of a same package are all mapped in the same scope, so we cannot just
+					// Imports of a same package are all mapped in the same scope, so we cannot just
 					// map them by their names, otherwise we could have collisions from same-name
 					// imports in different source files of the same package. Therefore, we suffix
 					// the key with the basename of the source file.
 					name = filepath.Join(name, baseName)
-					if _, exists := sc.sym[name]; !exists {
+					if sym, exists := sc.sym[name]; !exists {
 						sc.sym[name] = &symbol{kind: pkgSym, typ: &itype{cat: binPkgT, path: ipath, scope: sc}}
+						break
+					} else if sym.kind == pkgSym && sym.typ.cat == srcPkgT && sym.typ.path == ipath {
+						// ignore re-import of identical package
 						break
 					}
 
@@ -233,8 +239,11 @@ func (interp *Interpreter) gta(root *node, rpath, importPath string) ([]*node, e
 						name = pkgName
 					}
 					name = filepath.Join(name, baseName)
-					if _, exists := sc.sym[name]; !exists {
+					if sym, exists := sc.sym[name]; !exists {
 						sc.sym[name] = &symbol{kind: pkgSym, typ: &itype{cat: srcPkgT, path: ipath, scope: sc}}
+						break
+					} else if sym.kind == pkgSym && sym.typ.cat == srcPkgT && sym.typ.path == ipath {
+						// ignore re-import of identical package
 						break
 					}
 
@@ -257,13 +266,16 @@ func (interp *Interpreter) gta(root *node, rpath, importPath string) ([]*node, e
 
 			switch n.child[1].kind {
 			case identExpr, selectorExpr:
-				n.typ = &itype{cat: aliasT, val: typ, name: typeName, path: importPath, field: typ.field, incomplete: typ.incomplete, scope: sc, node: n.child[0]}
+				n.typ = namedOf(typ, importPath, typeName, withNode(n.child[0]), withScope(sc))
+				n.typ.incomplete = typ.incomplete
+				n.typ.field = typ.field
 				copy(n.typ.method, typ.method)
 			default:
 				n.typ = typ
 				n.typ.name = typeName
 				n.typ.path = importPath
 			}
+			n.typ.str = n.typ.path + "." + n.typ.name
 
 			asImportName := filepath.Join(typeName, baseName)
 			if _, exists := sc.sym[asImportName]; exists {

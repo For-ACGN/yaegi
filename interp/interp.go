@@ -7,13 +7,17 @@ import (
 	"flag"
 	"fmt"
 	"go/build"
+	"go/constant"
 	"go/scanner"
 	"go/token"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"log"
+	"math/bits"
 	"os"
 	"os/signal"
+	"path"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"runtime/debug"
@@ -113,6 +117,8 @@ func (f *frame) clone(fork bool) *frame {
 }
 
 // Exports stores the map of binary packages per package path.
+// The package path is the path joined from the import path and the package name
+// as specified in source files by the "package" statement.
 type Exports map[string]map[string]reflect.Value
 
 // imports stores the map of source packages per package path.
@@ -124,13 +130,15 @@ type opt struct {
 	cfgDot bool // display CFG graph (debug)
 	// dotCmd is the command to process the dot graph produced when astDot and/or
 	// cfgDot is enabled. It defaults to 'dot -Tdot -o <filename>.dot'.
-	dotCmd   string
-	noRun    bool          // compile, but do not run
-	fastChan bool          // disable cancellable chan operations
-	context  build.Context // build context: GOPATH, build constraints
-	stdin    io.Reader     // standard input
-	stdout   io.Writer     // standard output
-	stderr   io.Writer     // standard error
+	dotCmd       string
+	noRun        bool          // compile, but do not run
+	fastChan     bool          // disable cancellable chan operations
+	context      build.Context // build context: GOPATH, build constraints
+	specialStdio bool          // Allows os.Stdin, os.Stdout, os.Stderr to not be file descriptors
+	stdin        io.Reader     // standard input
+	stdout       io.Writer     // standard output
+	stderr       io.Writer     // standard error
+	filesystem   fs.FS
 }
 
 // Interpreter contains global resources and state.
@@ -168,7 +176,7 @@ type Interpreter struct {
 const (
 	mainID     = "main"
 	selfPrefix = "github.com/traefik/yaegi"
-	selfPath   = selfPrefix + "/interp"
+	selfPath   = selfPrefix + "/interp/interp"
 	// DefaultSourceName is the name used by default when the name of the input
 	// source file has not been specified for an Eval.
 	// TODO(mpl): something even more special as a name?
@@ -179,6 +187,9 @@ const (
 	// NoTest is the value to pass to EvalPath to skip evaluation of test functions.
 	NoTest = true
 )
+
+// Self points to the current interpreter if accessed from within itself, or is nil.
+var Self *Interpreter
 
 // Symbols exposes interpreter values.
 var Symbols = Exports{
@@ -195,6 +206,7 @@ func init() { Symbols[selfPath]["Symbols"] = reflect.ValueOf(Symbols) }
 
 // _error is a wrapper of error interface type.
 type _error struct {
+	IValue interface{}
 	WError func() string
 }
 
@@ -241,15 +253,21 @@ type Options struct {
 	BuildTags []string
 
 	// Standard input, output and error streams.
-	// They default to os.Stding, os.Stdout and os.Stderr respectively.
+	// They default to os.Stdin, os.Stdout and os.Stderr respectively.
 	Stdin          io.Reader
 	Stdout, Stderr io.Writer
+
+	// SourcecodeFilesystem is where the _sourcecode_ is loaded from and does
+	// NOT affect the filesystem of scripts when they run.
+	// It can be any fs.FS compliant filesystem (e.g. embed.FS, or fstest.MapFS for testing)
+	// See example/fs/fs_test.go for an example.
+	SourcecodeFilesystem fs.FS
 }
 
 // New returns a new interpreter.
 func New(options Options) *Interpreter {
 	i := Interpreter{
-		opt:      opt{context: build.Default},
+		opt:      opt{context: build.Default, filesystem: &RealFS{}},
 		frame:    newFrame(nil, 0, 0),
 		fset:     token.NewFileSet(),
 		universe: initUniverse(),
@@ -273,6 +291,10 @@ func New(options Options) *Interpreter {
 		i.opt.stderr = os.Stderr
 	}
 
+	if options.SourcecodeFilesystem != nil {
+		i.opt.filesystem = options.SourcecodeFilesystem
+	}
+
 	i.opt.context.GOPATH = options.GoPath
 	if len(options.BuildTags) > 0 {
 		i.opt.context.BuildTags = options.BuildTags
@@ -294,6 +316,11 @@ func New(options Options) *Interpreter {
 
 	// fastChan disables the cancellable version of channel operations in evalWithContext
 	i.opt.fastChan, _ = strconv.ParseBool(os.Getenv("YAEGI_FAST_CHAN"))
+
+	// specialStdio allows to assign directly io.Writer and io.Reader to os.Stdxxx,
+	// even if they are not file descriptors.
+	i.opt.specialStdio, _ = strconv.ParseBool(os.Getenv("YAEGI_SPECIAL_STDIO"))
+
 	return &i
 }
 
@@ -318,27 +345,27 @@ const (
 func initUniverse() *scope {
 	sc := &scope{global: true, sym: map[string]*symbol{
 		// predefined Go types
-		"bool":        {kind: typeSym, typ: &itype{cat: boolT, name: "bool"}},
-		"byte":        {kind: typeSym, typ: &itype{cat: uint8T, name: "uint8"}},
-		"complex64":   {kind: typeSym, typ: &itype{cat: complex64T, name: "complex64"}},
-		"complex128":  {kind: typeSym, typ: &itype{cat: complex128T, name: "complex128"}},
-		"error":       {kind: typeSym, typ: &itype{cat: errorT, name: "error"}},
-		"float32":     {kind: typeSym, typ: &itype{cat: float32T, name: "float32"}},
-		"float64":     {kind: typeSym, typ: &itype{cat: float64T, name: "float64"}},
-		"int":         {kind: typeSym, typ: &itype{cat: intT, name: "int"}},
-		"int8":        {kind: typeSym, typ: &itype{cat: int8T, name: "int8"}},
-		"int16":       {kind: typeSym, typ: &itype{cat: int16T, name: "int16"}},
-		"int32":       {kind: typeSym, typ: &itype{cat: int32T, name: "int32"}},
-		"int64":       {kind: typeSym, typ: &itype{cat: int64T, name: "int64"}},
-		"interface{}": {kind: typeSym, typ: &itype{cat: interfaceT}},
-		"rune":        {kind: typeSym, typ: &itype{cat: int32T, name: "int32"}},
-		"string":      {kind: typeSym, typ: &itype{cat: stringT, name: "string"}},
-		"uint":        {kind: typeSym, typ: &itype{cat: uintT, name: "uint"}},
-		"uint8":       {kind: typeSym, typ: &itype{cat: uint8T, name: "uint8"}},
-		"uint16":      {kind: typeSym, typ: &itype{cat: uint16T, name: "uint16"}},
-		"uint32":      {kind: typeSym, typ: &itype{cat: uint32T, name: "uint32"}},
-		"uint64":      {kind: typeSym, typ: &itype{cat: uint64T, name: "uint64"}},
-		"uintptr":     {kind: typeSym, typ: &itype{cat: uintptrT, name: "uintptr"}},
+		"bool":        {kind: typeSym, typ: &itype{cat: boolT, name: "bool", str: "bool"}},
+		"byte":        {kind: typeSym, typ: &itype{cat: uint8T, name: "uint8", str: "uint8"}},
+		"complex64":   {kind: typeSym, typ: &itype{cat: complex64T, name: "complex64", str: "complex64"}},
+		"complex128":  {kind: typeSym, typ: &itype{cat: complex128T, name: "complex128", str: "complex128"}},
+		"error":       {kind: typeSym, typ: &itype{cat: errorT, name: "error", str: "error"}},
+		"float32":     {kind: typeSym, typ: &itype{cat: float32T, name: "float32", str: "float32"}},
+		"float64":     {kind: typeSym, typ: &itype{cat: float64T, name: "float64", str: "float64"}},
+		"int":         {kind: typeSym, typ: &itype{cat: intT, name: "int", str: "int"}},
+		"int8":        {kind: typeSym, typ: &itype{cat: int8T, name: "int8", str: "int8"}},
+		"int16":       {kind: typeSym, typ: &itype{cat: int16T, name: "int16", str: "int16"}},
+		"int32":       {kind: typeSym, typ: &itype{cat: int32T, name: "int32", str: "int32"}},
+		"int64":       {kind: typeSym, typ: &itype{cat: int64T, name: "int64", str: "int64"}},
+		"interface{}": {kind: typeSym, typ: &itype{cat: interfaceT, str: "interface{}"}},
+		"rune":        {kind: typeSym, typ: &itype{cat: int32T, name: "int32", str: "int32"}},
+		"string":      {kind: typeSym, typ: &itype{cat: stringT, name: "string", str: "string"}},
+		"uint":        {kind: typeSym, typ: &itype{cat: uintT, name: "uint", str: "uint"}},
+		"uint8":       {kind: typeSym, typ: &itype{cat: uint8T, name: "uint8", str: "uint8"}},
+		"uint16":      {kind: typeSym, typ: &itype{cat: uint16T, name: "uint16", str: "uint16"}},
+		"uint32":      {kind: typeSym, typ: &itype{cat: uint32T, name: "uint32", str: "uint32"}},
+		"uint64":      {kind: typeSym, typ: &itype{cat: uint64T, name: "uint64", str: "uint64"}},
+		"uintptr":     {kind: typeSym, typ: &itype{cat: uintptrT, name: "uintptr", str: "uintptr"}},
 
 		// predefined Go constants
 		"false": {kind: constSym, typ: untypedBool(), rval: reflect.ValueOf(false)},
@@ -346,7 +373,7 @@ func initUniverse() *scope {
 		"iota":  {kind: constSym, typ: untypedInt()},
 
 		// predefined Go zero value
-		"nil": {typ: &itype{cat: nilT, untyped: true}},
+		"nil": {typ: &itype{cat: nilT, untyped: true, str: "nil"}},
 
 		// predefined Go builtins
 		bltnAppend:  {kind: bltnSym, builtin: _append},
@@ -393,12 +420,12 @@ func (interp *Interpreter) Eval(src string) (res reflect.Value, err error) {
 // by the interpreter, and a non nil error in case of failure.
 // The main function of the main package is executed if present.
 func (interp *Interpreter) EvalPath(path string) (res reflect.Value, err error) {
-	if !isFile(path) {
+	if !isFile(interp.opt.filesystem, path) {
 		_, err := interp.importSrc(mainID, path, NoTest)
 		return res, err
 	}
 
-	b, err := ioutil.ReadFile(path)
+	b, err := fs.ReadFile(interp.filesystem, path)
 	if err != nil {
 		return res, err
 	}
@@ -470,8 +497,8 @@ func (interp *Interpreter) Symbols(importPath string) Exports {
 	return m
 }
 
-func isFile(path string) bool {
-	fi, err := os.Stat(path)
+func isFile(filesystem fs.FS, path string) bool {
+	fi, err := fs.Stat(filesystem, path)
 	return err == nil && fi.Mode().IsRegular()
 }
 
@@ -641,35 +668,47 @@ func (interp *Interpreter) getWrapper(t reflect.Type) reflect.Type {
 
 // Use loads binary runtime symbols in the interpreter context so
 // they can be used in interpreted code.
-func (interp *Interpreter) Use(values Exports) {
+func (interp *Interpreter) Use(values Exports) error {
 	for k, v := range values {
-		if k == selfPrefix {
+		importPath := path.Dir(k)
+		packageName := path.Base(k)
+
+		if importPath == "." {
+			return fmt.Errorf("export path %[1]q is missing a package name; did you mean '%[1]s/%[1]s'?", k)
+		}
+
+		if importPath == selfPrefix {
 			interp.hooks.Parse(v)
 			continue
 		}
 
-		if interp.binPkg[k] == nil {
-			interp.binPkg[k] = make(map[string]reflect.Value)
+		if interp.binPkg[importPath] == nil {
+			interp.binPkg[importPath] = make(map[string]reflect.Value)
+			interp.pkgNames[importPath] = packageName
 		}
 
 		for s, sym := range v {
-			interp.binPkg[k][s] = sym
+			interp.binPkg[importPath][s] = sym
+		}
+		if k == selfPath {
+			interp.binPkg[importPath]["Self"] = reflect.ValueOf(interp)
 		}
 	}
 
 	// Checks if input values correspond to stdlib packages by looking for one
 	// well known stdlib package path.
-	if _, ok := values["fmt"]; ok {
-		fixStdio(interp)
+	if _, ok := values["fmt/fmt"]; ok {
+		fixStdlib(interp)
 	}
+	return nil
 }
 
-// fixStdio redefines interpreter stdlib symbols to use the standard input,
+// fixStdlib redefines interpreter stdlib symbols to use the standard input,
 // output and errror assigned to the interpreter. The changes are limited to
-// the interpreter only. Global values os.Stdin, os.Stdout and os.Stderr are
-// not changed. Note that it is possible to escape the virtualized stdio by
+// the interpreter only.
+// Note that it is possible to escape the virtualized stdio by
 // read/write directly to file descriptors 0, 1, 2.
-func fixStdio(interp *Interpreter) {
+func fixStdlib(interp *Interpreter) {
 	p := interp.binPkg["fmt"]
 	if p == nil {
 		return
@@ -714,9 +753,28 @@ func fixStdio(interp *Interpreter) {
 	}
 
 	if p = interp.binPkg["os"]; p != nil {
-		p["Stdin"] = reflect.ValueOf(&stdin).Elem()
-		p["Stdout"] = reflect.ValueOf(&stdout).Elem()
-		p["Stderr"] = reflect.ValueOf(&stderr).Elem()
+		if interp.specialStdio {
+			// Inherit streams from interpreter even if they do not have a file descriptor.
+			p["Stdin"] = reflect.ValueOf(&stdin).Elem()
+			p["Stdout"] = reflect.ValueOf(&stdout).Elem()
+			p["Stderr"] = reflect.ValueOf(&stderr).Elem()
+		} else {
+			// Inherits streams from interpreter only if they have a file descriptor and preserve original type.
+			if s, ok := stdin.(*os.File); ok {
+				p["Stdin"] = reflect.ValueOf(&s).Elem()
+			}
+			if s, ok := stdout.(*os.File); ok {
+				p["Stdout"] = reflect.ValueOf(&s).Elem()
+			}
+			if s, ok := stderr.(*os.File); ok {
+				p["Stderr"] = reflect.ValueOf(&s).Elem()
+			}
+		}
+	}
+
+	if p = interp.binPkg["math/bits"]; p != nil {
+		// Do not trust extracted value maybe from another arch.
+		p["UintSize"] = reflect.ValueOf(constant.MakeInt64(bits.UintSize))
 	}
 }
 
@@ -736,24 +794,47 @@ func ignoreScannerError(e *scanner.Error, s string) bool {
 	return false
 }
 
+// ImportUsed automatically imports pre-compiled packages included by Use().
+// This is mainly useful for REPLs, or single command lines. In case of an ambiguous default
+// package name, for example "rand" for crypto/rand and math/rand, the package name is
+// constructed by replacing the last "/" by a "_", producing crypto_rand and math_rand.
+// ImportUsed should not be called more than once, and not after a first Eval, as it may
+// rename packages.
+func (interp *Interpreter) ImportUsed() {
+	sc := interp.universe
+	for k := range interp.binPkg {
+		// By construction, the package name is the last path element of the key.
+		name := path.Base(k)
+		if sym, ok := sc.sym[name]; ok {
+			// Handle collision by renaming old and new entries.
+			name2 := key2name(fixKey(sym.typ.path))
+			sc.sym[name2] = sym
+			if name2 != name {
+				delete(sc.sym, name)
+			}
+			name = key2name(fixKey(k))
+		}
+		sc.sym[name] = &symbol{kind: pkgSym, typ: &itype{cat: binPkgT, path: k, scope: sc}}
+	}
+}
+
+func key2name(name string) string {
+	return filepath.Join(name, DefaultSourceName)
+}
+
+func fixKey(k string) string {
+	i := strings.LastIndex(k, "/")
+	if i >= 0 {
+		k = k[:i] + "_" + k[i+1:]
+	}
+	return k
+}
+
 // REPL performs a Read-Eval-Print-Loop on input reader.
 // Results are printed to the output writer of the Interpreter, provided as option
 // at creation time. Errors are printed to the similarly defined errors writer.
 // The last interpreter result value and error are returned.
 func (interp *Interpreter) REPL() (reflect.Value, error) {
-	// Preimport used bin packages, to avoid having to import these packages manually
-	// in REPL mode. These packages are already loaded anyway.
-	sc := interp.universe
-	for k := range interp.binPkg {
-		name := identifier.FindString(k)
-		if name == "" || name == "rand" || name == "scanner" || name == "template" || name == "pprof" {
-			// Skip any package with an ambiguous name (i.e crypto/rand vs math/rand).
-			// Those will have to be imported explicitly.
-			continue
-		}
-		sc.sym[name] = &symbol{kind: pkgSym, typ: &itype{cat: binPkgT, path: k, scope: sc}}
-	}
-
 	in, out, errs := interp.stdin, interp.stdout, interp.stderr
 	ctx, cancel := context.WithCancel(context.Background())
 	end := make(chan struct{})     // channel to terminate the REPL

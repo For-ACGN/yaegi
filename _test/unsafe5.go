@@ -1,9 +1,11 @@
 package main
 
 import (
-	"fmt"
+	"math/bits"
 	"unsafe"
 )
+
+const WSize = bits.UintSize / 8
 
 type S struct {
 	X int
@@ -12,11 +14,13 @@ type S struct {
 }
 
 func main() {
-	size := unsafe.Sizeof(S{})
-	align := unsafe.Alignof(S{})
+	x := S{}
+	size := unsafe.Sizeof(x) / WSize
+	align := unsafe.Alignof(x.Y) / WSize
+	offset := unsafe.Offsetof(x.Z) / WSize
 
-	fmt.Println(size, align)
+	println(size, align, offset)
 }
 
 // Output:
-// 24 8
+// 3 1 2
