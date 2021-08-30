@@ -5,8 +5,8 @@
 package unsafe
 
 import (
-	"errors"
 	"reflect"
+	"runtime"
 	"unsafe"
 )
 
@@ -22,34 +22,29 @@ func add(ptr unsafe.Pointer, l int) unsafe.Pointer {
 
 type emptyInterface struct {
 	_    uintptr
-	data unsafe.Pointer
+	word unsafe.Pointer
 }
 
-func slice(i interface{}, l int) interface{} {
-	if l == 0 {
-		return nil
+func slice(ptr interface{}, l int) interface{} {
+	val := reflect.ValueOf(ptr)
+	if val.Type().Kind() != reflect.Ptr {
+		panic("unsafe.Slice: first argument to unsafe.Slice must be pointer")
 	}
-
-	v := reflect.ValueOf(i)
-	if v.Type().Kind() != reflect.Ptr {
-		panic(errors.New("first argument to unsafe.Slice must be pointer"))
-	}
-	if v.IsNil() {
-		panic(errors.New("unsafe.Slice: ptr is nil and len is not zero"))
-	}
-
 	if l < 0 {
-		panic(errors.New("unsafe.Slice: len out of range"))
+		panic("unsafe.Slice: negative len")
 	}
-
-	ih := *(*emptyInterface)(unsafe.Pointer(&i))
-
-	inter := reflect.MakeSlice(reflect.SliceOf(v.Type().Elem()), l, l).Interface()
-	ptr := (*emptyInterface)(unsafe.Pointer(&inter)).data
-	sh := (*reflect.SliceHeader)(ptr)
-	sh.Data = uintptr(ih.data)
-	sh.Len = l
-	sh.Cap = l
-
-	return inter
+	if val.IsNil() && l != 0 {
+		panic("unsafe.Slice: ptr is nil and len is not zero")
+	}
+	typ := reflect.SliceOf(val.Type().Elem())
+	s := reflect.MakeSlice(typ, l, l).Interface()
+	addr := (*emptyInterface)(unsafe.Pointer(&s)).word
+	sh := (*reflect.SliceHeader)(addr)
+	if val.IsNil() {
+		sh.Data = 0 // for type []int(nil)
+	} else {
+		sh.Data = val.Pointer() // for type []int{}
+	}
+	runtime.KeepAlive(&ptr)
+	return s
 }
