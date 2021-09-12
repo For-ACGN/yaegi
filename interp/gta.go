@@ -3,7 +3,6 @@ package interp
 import (
 	"path"
 	"path/filepath"
-	"reflect"
 )
 
 // gta performs a global types analysis on the AST, registering types,
@@ -53,7 +52,7 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 
 			for i := 0; i < n.nleft; i++ {
 				dest, src := n.child[i], n.child[sbase+i]
-				val := reflect.ValueOf(sc.iota)
+				val := src.rval
 				if n.anc.kind == constDecl {
 					if _, err2 := interp.cfg(n, importPath, pkgName); err2 != nil {
 						// Constant value can not be computed yet.
@@ -286,10 +285,15 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 			sym, exists := sc.sym[typeName]
 			if !exists {
 				sc.sym[typeName] = &symbol{kind: typeSym}
-			} else if sym.typ == nil || len(sym.typ.method) == 0 {
-				// TODO(mpl): figure out how to detect redeclarations without breaking type aliases.
-				// Allow redeclarations for now.
-				sc.sym[typeName] = &symbol{kind: typeSym}
+			} else {
+				if sym.typ != nil && (len(sym.typ.method) > 0) {
+					// Type has already been seen as a receiver in a method function
+					n.typ.method = append(n.typ.method, sym.typ.method...)
+				} else {
+					// TODO(mpl): figure out how to detect redeclarations without breaking type aliases.
+					// Allow redeclarations for now.
+					sc.sym[typeName] = &symbol{kind: typeSym}
+				}
 			}
 			sc.sym[typeName].typ = n.typ
 			if !n.typ.isComplete() {
